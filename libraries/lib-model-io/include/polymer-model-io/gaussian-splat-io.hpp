@@ -13,7 +13,7 @@ namespace polymer
     {
         float4 position;       // xyz + w=1
         float4 scale_opacity;  // scale xyz (exp applied) + sigmoid(opacity)
-        float4 rotation;       // quaternion xyzw (normalized)
+        float4 rotation;       // normalized quaternion stored (w, x, y, z) in xyzw slots, real part first
         float shs[48];         // 16 SH coeffs x 3 RGB (interleaved)
     };
 

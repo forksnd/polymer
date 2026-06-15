@@ -1,0 +1,27 @@
+#version 450 core
+
+// Hierarchical exclusive scan, pass C: add the scanned block offset to every element.
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (std430, binding = 0) readonly buffer ScanLength {
+    uint scan_length;
+};
+
+layout (std430, binding = 2) buffer OutputData {
+    uint out_data[];
+};
+
+layout (std430, binding = 3) readonly buffer BlockSums {
+    uint block_sums[];
+};
+
+void main() {
+    uint block = gl_WorkGroupID.x;
+    uint base = block * 2048u + gl_LocalInvocationID.x * 8u;
+    uint add = block_sums[block];
+    if (add == 0u) return;
+    for (uint j = 0u; j < 8u; ++j) {
+        if (base + j < scan_length) out_data[base + j] += add;
+    }
+}

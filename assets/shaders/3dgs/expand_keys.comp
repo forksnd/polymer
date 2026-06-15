@@ -1,0 +1,79 @@
+#version 450 core
+
+// Expands each visible gaussian into one (key, payload) pair per overlapped tile, at the
+// offsets produced by the exclusive scan. Key layout: [tile_id : tile_bits][top bits of
+// the positive-float view depth : 32 - tile_bits]. Positive IEEE-754 floats sort by raw
+// bits, and the near cull guarantees depth > 0.2, so truncated bits stay monotone.
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (std140, binding = 0) uniform FrameParams {
+    mat4 view_3dgs;
+    mat4 viewproj;
+    vec4 cam_pos_model;
+    vec4 bg_color;
+    uvec2 resolution;
+    uvec2 tile_grid;
+    uint tile_bits;
+    uint num_gaussians;
+    uint sh_degree;
+    float scale_modifier;
+    float tan_fovx;
+    float tan_fovy;
+    float focal_x;
+    float focal_y;
+};
+
+layout (std430, binding = 1) readonly buffer GpuState {
+    uint total_unclamped;
+    uint num_instances;
+    uint num_wgs_sort;
+    uint instance_capacity;
+};
+
+layout (std430, binding = 2) readonly buffer TileCounts {
+    uint tile_counts[];
+};
+
+layout (std430, binding = 3) readonly buffer Offsets {
+    uint offsets[];
+};
+
+layout (std430, binding = 4) readonly buffer EmitAttrs {
+    uvec4 emit_attrs[]; // aabb min (y16|x16), aabb max (y16|x16), float bits of depth, unused
+};
+
+layout (std430, binding = 5) writeonly buffer Keys {
+    uint keys[];
+};
+
+layout (std430, binding = 6) writeonly buffer Payloads {
+    uint payloads[];
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= num_gaussians) return;
+
+    uint count = tile_counts[i];
+    if (count == 0u) return;
+
+    uint write = offsets[i];
+    uvec4 e = emit_attrs[i];
+    uint min_x = e.x & 0xFFFFu;
+    uint min_y = e.x >> 16u;
+    uint max_x = e.y & 0xFFFFu;
+    uint max_y = e.y >> 16u;
+    uint depth_bits = 32u - tile_bits;
+    uint depth_key = e.z >> tile_bits;
+
+    for (uint ty = min_y; ty < max_y; ++ty) {
+        for (uint tx = min_x; tx < max_x; ++tx) {
+            if (write >= instance_capacity) return; // overflow guard, see prepare_dispatch
+            uint tile = ty * tile_grid.x + tx;
+            keys[write] = (tile << depth_bits) | depth_key;
+            payloads[write] = i;
+            write++;
+        }
+    }
+}

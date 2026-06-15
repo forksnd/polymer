@@ -1,49 +1,57 @@
 #version 450 core
 
+// Per-gaussian preprocess: cull, project, EWA covariance projection, spherical harmonics
+// evaluation, and tight tile-extent computation. View convention is INRIA/COLMAP-style
+// +z forward (the CPU premultiplies the GL right-handed view with diag(1,1,-1)), while
+// clip positions use the untouched GL projection chain, so NDC x/y and the covariance
+// share the same screen orientation.
+
 layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-struct Vertex {
-    vec4 position;
-    vec4 scale_opacity;
-    vec4 rotation;
-    float sh[48];
+layout (std140, binding = 0) uniform FrameParams {
+    mat4 view_3dgs;
+    mat4 viewproj;
+    vec4 cam_pos_model;
+    vec4 bg_color;
+    uvec2 resolution;
+    uvec2 tile_grid;
+    uint tile_bits;
+    uint num_gaussians;
+    uint sh_degree;
+    float scale_modifier;
+    float tan_fovx;
+    float tan_fovy;
+    float focal_x;
+    float focal_y;
 };
 
-struct VertexAttribute {
-    vec4 conic_opacity;
-    vec4 color_radii;
-    uvec4 aabb;
-    vec2 uv;
-    float depth;
-    uint pad;
+layout (std430, binding = 1) readonly buffer PosOpacity {
+    vec4 pos_opacity[]; // xyz position, w = post-sigmoid opacity
 };
 
-layout (std430, binding = 0) readonly buffer Vertices {
-    Vertex vertices[];
-};
-
-layout (std430, binding = 1) readonly buffer Cov3Ds {
+layout (std430, binding = 2) readonly buffer Cov3Ds {
     float cov3ds[];
 };
 
-layout (std140, binding = 2) uniform Params {
-    vec4 camera_position;
-    mat4 proj_mat;
-    mat4 view_mat;
-    uint width;
-    uint height;
-    float tan_fovx;
-    float tan_fovy;
-    uint sh_degree;
-    uint num_gaussians;
+layout (std430, binding = 3) readonly buffer ShCoeffs {
+    uint sh_coeffs[]; // 48 half floats (16 coeffs x rgb) packed into 24 uints per gaussian
 };
 
-layout (std430, binding = 3) writeonly buffer VertexAttributes {
-    VertexAttribute attr[];
+layout (std430, binding = 4) writeonly buffer TileCounts {
+    uint tile_counts[];
 };
 
-layout (std430, binding = 4) writeonly buffer NumTilesOverlap {
-    uint tiles_overlap[];
+struct render_attr {
+    vec4 conic_opacity;
+    vec4 uv_color; // uv.xy, packHalf2x16(color.rg), packHalf2x16(color.b, 0)
+};
+
+layout (std430, binding = 5) writeonly buffer RenderAttrs {
+    render_attr render_attrs[];
+};
+
+layout (std430, binding = 6) writeonly buffer EmitAttrs {
+    uvec4 emit_attrs[]; // aabb min (y16|x16), aabb max (y16|x16), float bits of depth, unused
 };
 
 const float SH_C0 = 0.28209479177387814;
@@ -65,161 +73,125 @@ const float SH_C3[7] = float[7](
     -0.5900435899266435
 );
 
-mat3 get_projection_jacobian_approx(vec3 t) {
-    float limx = 1.3 * tan_fovx;
-    float limy = 1.3 * tan_fovy;
-    float txtz = t.x / t.z;
-    float tytz = t.y / t.z;
-    t.x = min(limx, max(-limx, txtz)) * t.z;
-    t.y = min(limy, max(-limy, tytz)) * t.z;
-
-    float focal_x = float(width) / (2.0 * tan_fovx);
-    float focal_y = float(height) / (2.0 * tan_fovy);
-
-    return mat3(
-        focal_x / t.z, 0.0, -(focal_x * t.x) / (t.z * t.z),
-        0.0, focal_y / t.z, -(focal_y * t.y) / (t.z * t.z),
-        0.0, 0.0, 0.0
-    );
+float fetch_sh(uint gaussian, uint flat_index) {
+    uint word = sh_coeffs[gaussian * 24u + (flat_index >> 1u)];
+    vec2 pair = unpackHalf2x16(word);
+    return (flat_index & 1u) == 0u ? pair.x : pair.y;
 }
 
-mat2 compute_cov2d(uint index, vec3 cam) {
-    mat3 J = get_projection_jacobian_approx(cam);
-    mat3 W = transpose(mat3(view_mat));
-    mat3 Sigma = mat3(
-        cov3ds[index * 6 + 0], cov3ds[index * 6 + 1], cov3ds[index * 6 + 2],
-        cov3ds[index * 6 + 1], cov3ds[index * 6 + 3], cov3ds[index * 6 + 4],
-        cov3ds[index * 6 + 2], cov3ds[index * 6 + 4], cov3ds[index * 6 + 5]
-    );
-    mat3 T = W * J;
-    mat3 cov2d = transpose(T) * Sigma * T;
-
-    // Add low-pass filter for anti-aliasing
-    cov2d[0][0] += 0.3;
-    cov2d[1][1] += 0.3;
-
-    return mat2(cov2d);
+vec3 fetch_sh_vec3(uint gaussian, uint coeff) {
+    uint base = coeff * 3u;
+    return vec3(fetch_sh(gaussian, base), fetch_sh(gaussian, base + 1u), fetch_sh(gaussian, base + 2u));
 }
 
-vec3 get_sh_vec3(uint index, uint ind) {
-    return vec3(
-        vertices[index].sh[ind * 3 + 0],
-        vertices[index].sh[ind * 3 + 1],
-        vertices[index].sh[ind * 3 + 2]
-    );
-}
+vec3 compute_sh(uint i, vec3 position) {
+    vec3 dir = normalize(position - cam_pos_model.xyz);
+    float x = dir.x;
+    float y = dir.y;
+    float z = dir.z;
 
-vec3 compute_sh(uint index) {
-    vec3 ray_direction = vertices[index].position.xyz - camera_position.xyz;
-    ray_direction = normalize(ray_direction);
-    float x = ray_direction.x;
-    float y = ray_direction.y;
-    float z = ray_direction.z;
+    vec3 c = SH_C0 * fetch_sh_vec3(i, 0u);
 
-    vec3 c = SH_C0 * get_sh_vec3(index, 0);
-
-    if (sh_degree >= 1) {
-        c -= SH_C1 * get_sh_vec3(index, 1) * y;
-        c += SH_C1 * get_sh_vec3(index, 2) * z;
-        c -= SH_C1 * get_sh_vec3(index, 3) * x;
+    if (sh_degree >= 1u) {
+        c -= SH_C1 * fetch_sh_vec3(i, 1u) * y;
+        c += SH_C1 * fetch_sh_vec3(i, 2u) * z;
+        c -= SH_C1 * fetch_sh_vec3(i, 3u) * x;
     }
 
-    if (sh_degree >= 2) {
-        c += SH_C2[0] * get_sh_vec3(index, 4) * x * y;
-        c += SH_C2[1] * get_sh_vec3(index, 5) * y * z;
-        c += SH_C2[2] * get_sh_vec3(index, 6) * (2.0 * z * z - x * x - y * y);
-        c += SH_C2[3] * get_sh_vec3(index, 7) * z * x;
-        c += SH_C2[4] * get_sh_vec3(index, 8) * (x * x - y * y);
-    }
+    if (sh_degree >= 2u) {
+        float xx = x * x, yy = y * y, zz = z * z;
+        float xy = x * y, yz = y * z, xz = x * z;
+        c += SH_C2[0] * fetch_sh_vec3(i, 4u) * xy;
+        c += SH_C2[1] * fetch_sh_vec3(i, 5u) * yz;
+        c += SH_C2[2] * fetch_sh_vec3(i, 6u) * (2.0 * zz - xx - yy);
+        c += SH_C2[3] * fetch_sh_vec3(i, 7u) * xz;
+        c += SH_C2[4] * fetch_sh_vec3(i, 8u) * (xx - yy);
 
-    if (sh_degree >= 3) {
-        c += SH_C3[0] * get_sh_vec3(index, 9) * (3.0 * x * x - y * y) * y;
-        c += SH_C3[1] * get_sh_vec3(index, 10) * x * y * z;
-        c += SH_C3[2] * get_sh_vec3(index, 11) * (4.0 * z * z - x * x - y * y) * y;
-        c += SH_C3[3] * get_sh_vec3(index, 12) * z * (2.0 * z * z - 3.0 * x * x - 3.0 * y * y);
-        c += SH_C3[4] * get_sh_vec3(index, 13) * x * (4.0 * z * z - x * x - y * y);
-        c += SH_C3[5] * get_sh_vec3(index, 14) * (x * x - y * y) * z;
-        c += SH_C3[6] * get_sh_vec3(index, 15) * x * (x * x - 3.0 * y * y);
+        if (sh_degree >= 3u) {
+            c += SH_C3[0] * fetch_sh_vec3(i, 9u) * y * (3.0 * xx - yy);
+            c += SH_C3[1] * fetch_sh_vec3(i, 10u) * xy * z;
+            c += SH_C3[2] * fetch_sh_vec3(i, 11u) * y * (4.0 * zz - xx - yy);
+            c += SH_C3[3] * fetch_sh_vec3(i, 12u) * z * (2.0 * zz - 3.0 * xx - 3.0 * yy);
+            c += SH_C3[4] * fetch_sh_vec3(i, 13u) * x * (4.0 * zz - xx - yy);
+            c += SH_C3[5] * fetch_sh_vec3(i, 14u) * z * (xx - yy);
+            c += SH_C3[6] * fetch_sh_vec3(i, 15u) * x * (xx - 3.0 * yy);
+        }
     }
 
     c += 0.5;
-    c = max(c, vec3(0.0));
-
-    return c;
+    return max(c, vec3(0.0));
 }
 
-float ndc2Pix(float v, int S) {
-    return ((v + 1.0) * float(S) - 1.0) * 0.5;
+float ndc2pix(float v, uint s) {
+    return ((v + 1.0) * float(s) - 1.0) * 0.5;
 }
 
 void main() {
-    uint index = gl_GlobalInvocationID.x;
-    if (index >= num_gaussians) {
-        return;
-    }
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= num_gaussians) return;
 
-    ivec2 tile_shape = ivec2(
-        (width + 16 - 1) / 16,
-        (height + 16 - 1) / 16
-    );
+    tile_counts[i] = 0u;
 
-    // Initialize as culled
-    attr[index].color_radii.w = 0.0;
-    tiles_overlap[index] = 0;
+    vec4 po = pos_opacity[i];
+    float opacity = po.w;
+    if (opacity < (1.0 / 255.0)) return; // can never pass the render loop's alpha cutoff
 
-    // Transform to clip space
-    vec4 p_hom = proj_mat * vertices[index].position;
-    float p_w = 1.0 / (p_hom.w + 0.0001);
-    vec3 ndc = p_hom.xyz * p_w;
+    vec4 p_view = view_3dgs * vec4(po.xyz, 1.0);
+    if (p_view.z <= 0.2) return;
 
-    // Transform to view space
-    vec4 p_view = view_mat * vertices[index].position;
+    vec4 p_hom = viewproj * vec4(po.xyz, 1.0);
+    float inv_w = 1.0 / (p_hom.w + 0.0001);
+    vec2 ndc = p_hom.xy * inv_w;
 
-    // Cull behind camera
-    if (p_view.z <= 0.2) {
-        return;
-    }
+    // EWA projection: Sigma' = J W Sigma W^T J^T (J and W stored transposed, the algebra
+    // self-cancels through cov = T^T Sigma T -- matches the INRIA reference exactly).
+    vec3 t = p_view.xyz;
+    float limx = 1.3 * tan_fovx;
+    float limy = 1.3 * tan_fovy;
+    t.x = clamp(t.x / t.z, -limx, limx) * t.z;
+    t.y = clamp(t.y / t.z, -limy, limy) * t.z;
 
-    // Compute 2D covariance
-    mat2 cov2d = compute_cov2d(index, p_view.xyz);
-    float det = determinant(cov2d);
-    if (det <= 0.0) {
-        return;
-    }
+    mat3 J = mat3(
+        focal_x / t.z, 0.0, -(focal_x * t.x) / (t.z * t.z),
+        0.0, focal_y / t.z, -(focal_y * t.y) / (t.z * t.z),
+        0.0, 0.0, 0.0);
+    mat3 W = transpose(mat3(view_3dgs));
+    mat3 Sigma = mat3(
+        cov3ds[i * 6u + 0u], cov3ds[i * 6u + 1u], cov3ds[i * 6u + 2u],
+        cov3ds[i * 6u + 1u], cov3ds[i * 6u + 3u], cov3ds[i * 6u + 4u],
+        cov3ds[i * 6u + 2u], cov3ds[i * 6u + 4u], cov3ds[i * 6u + 5u]);
+    mat3 T = W * J;
+    mat3 cov_full = transpose(T) * Sigma * T;
 
-    // Compute conic (inverse of 2D covariance)
-    mat2 conic = inverse(cov2d);
-    attr[index].conic_opacity.xyz = vec3(conic[0][0], conic[0][1], conic[1][1]);
-    attr[index].conic_opacity.w = vertices[index].scale_opacity.w;
+    // Low-pass dilation: every splat is at least ~half a pixel wide
+    vec3 cov2d = vec3(cov_full[0][0] + 0.3, cov_full[0][1], cov_full[1][1] + 0.3);
+    float det = cov2d.x * cov2d.z - cov2d.y * cov2d.y;
+    if (!(det > 0.0)) return; // written this way to also reject NaN covariance
 
-    // Compute screen-space radius from eigenvalues
-    float mid = 0.5 * (cov2d[0][0] + cov2d[1][1]);
-    float lambda1 = mid + sqrt(max(0.1, mid * mid - det));
-    float lambda2 = mid - sqrt(max(0.1, mid * mid - det));
-    float lambda = max(lambda1, lambda2);
-    float radii = ceil(3.0 * sqrt(lambda));
+    float det_inv = 1.0 / det;
+    vec3 conic = vec3(cov2d.z * det_inv, -cov2d.y * det_inv, cov2d.x * det_inv);
 
-    // Screen-space position
-    vec2 uv = vec2(ndc2Pix(ndc.x, int(width)), ndc2Pix(ndc.y, int(height)));
+    // Opacity-aware extent: largest Mahalanobis distance that can still contribute
+    // alpha >= 1/255, capped at the full footprint sqrt(2 ln 255) ~= 3.33 sigma.
+    // Per-axis ellipse AABB half-extents are extend * sqrt(diagonal of the covariance).
+    float extend = min(3.33, sqrt(max(0.0, 2.0 * log(255.0 * opacity))));
+    vec2 uv = vec2(ndc2pix(ndc.x, resolution.x), ndc2pix(ndc.y, resolution.y));
+    vec2 ext = vec2(extend * sqrt(cov2d.x), extend * sqrt(cov2d.z));
 
-    // Compute tile bounding box
-    uvec4 bounding_box = uvec4(
-        uint(clamp(int((uv.x - radii) / 16.0), 0, tile_shape.x)),
-        uint(clamp(int((uv.y - radii) / 16.0), 0, tile_shape.y)),
-        uint(clamp(int((uv.x + radii + 16.0 - 1.0) / 16.0), 0, tile_shape.x)),
-        uint(clamp(int((uv.y + radii + 16.0 - 1.0) / 16.0), 0, tile_shape.y))
-    );
+    ivec2 tmin = ivec2(
+        clamp(int((uv.x - ext.x) / 16.0), 0, int(tile_grid.x)),
+        clamp(int((uv.y - ext.y) / 16.0), 0, int(tile_grid.y)));
+    ivec2 tmax = ivec2(
+        clamp(int((uv.x + ext.x + 15.0) / 16.0), 0, int(tile_grid.x)),
+        clamp(int((uv.y + ext.y + 15.0) / 16.0), 0, int(tile_grid.y)));
 
-    uint num_tiles_overlap = (bounding_box.z - bounding_box.x) * (bounding_box.w - bounding_box.y);
-    if (num_tiles_overlap == 0) {
-        return;
-    }
+    uint overlap = uint(max(tmax.x - tmin.x, 0)) * uint(max(tmax.y - tmin.y, 0));
+    if (overlap == 0u) return;
 
-    attr[index].aabb = bounding_box;
-    tiles_overlap[index] = num_tiles_overlap;
-    attr[index].depth = p_view.z;
-    attr[index].color_radii.w = radii;
-    attr[index].color_radii.xyz = compute_sh(index);
-    attr[index].uv = uv;
-    attr[index].pad = 0;
+    vec3 color = compute_sh(i, po.xyz);
+
+    tile_counts[i] = overlap;
+    render_attrs[i].conic_opacity = vec4(conic, opacity);
+    render_attrs[i].uv_color = vec4(uv, uintBitsToFloat(packHalf2x16(color.rg)), uintBitsToFloat(packHalf2x16(vec2(color.b, 0.0))));
+    emit_attrs[i] = uvec4(uint(tmin.x) | (uint(tmin.y) << 16), uint(tmax.x) | (uint(tmax.y) << 16), floatBitsToUint(p_view.z), 0u);
 }

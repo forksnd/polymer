@@ -1,0 +1,65 @@
+#version 450 core
+
+// Reads the scan result and writes every downstream dispatch size on the GPU, so the
+// CPU never has to read the instance count back. Slot layout of the indirect buffer:
+// [0] radix hist/scatter, [1] histogram scan passes A/C, [2] tile boundary.
+
+layout (local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout (std140, binding = 0) uniform FrameParams {
+    mat4 view_3dgs;
+    mat4 viewproj;
+    vec4 cam_pos_model;
+    vec4 bg_color;
+    uvec2 resolution;
+    uvec2 tile_grid;
+    uint tile_bits;
+    uint num_gaussians;
+    uint sh_degree;
+    float scale_modifier;
+    float tan_fovx;
+    float tan_fovy;
+    float focal_x;
+    float focal_y;
+};
+
+layout (std430, binding = 1) buffer GpuState {
+    uint total_unclamped;
+    uint num_instances;
+    uint num_wgs_sort;
+    uint instance_capacity;
+};
+
+layout (std430, binding = 2) readonly buffer TileCounts {
+    uint tile_counts[];
+};
+
+layout (std430, binding = 3) readonly buffer Offsets {
+    uint offsets[];
+};
+
+layout (std430, binding = 4) writeonly buffer IndirectArgs {
+    uvec4 args[];
+};
+
+layout (std430, binding = 5) writeonly buffer HistScanLength {
+    uint hist_scan_length;
+};
+
+void main() {
+    // offsets[] is an exclusive scan of tile_counts[], so total = last offset + last count
+    uint total = offsets[num_gaussians - 1u] + tile_counts[num_gaussians - 1u];
+    total_unclamped = total;
+
+    uint clamped = min(total, instance_capacity);
+    num_instances = clamped;
+
+    uint wgs = (clamped + 8191u) / 8192u; // 256 threads x 32 blocks per sort workgroup
+    num_wgs_sort = wgs;
+
+    args[0] = uvec4(wgs, 1u, 1u, 0u);
+    args[1] = uvec4((256u * wgs + 2047u) / 2048u, 1u, 1u, 0u);
+    args[2] = uvec4((clamped + 1023u) / 1024u, 1u, 1u, 0u);
+
+    hist_scan_length = 256u * wgs;
+}

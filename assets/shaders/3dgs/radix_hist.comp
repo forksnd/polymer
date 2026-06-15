@@ -1,47 +1,48 @@
 #version 450 core
-#extension GL_ARB_gpu_shader_int64 : enable
 
-#define RADIX_BITS 8
-#define RADIX_SIZE (1 << RADIX_BITS)  // 256
-#define WORKGROUP_SIZE 256
+// Stable LSD radix sort, stage 1 of 3: per-workgroup digit histogram.
+// Digit-major output layout (histogram[digit * num_wgs + wg]) so that one exclusive
+// scan of the flat table yields the global stable base offset for every (digit, wg).
+// Every active workgroup writes all 256 of its cells, so the table never needs clearing.
 
-layout (local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+#define BLOCKS_PER_WG 32u
 
-layout (std430, binding = 0) readonly buffer Keys {
-    uint64_t keys[];
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (std430, binding = 0) readonly buffer GpuState {
+    uint total_unclamped;
+    uint num_instances;
+    uint num_wgs_sort;
+    uint instance_capacity;
 };
 
-layout (std430, binding = 1) buffer Histogram {
+layout (std430, binding = 1) readonly buffer KeysIn {
+    uint keys_in[];
+};
+
+layout (std430, binding = 2) writeonly buffer Histogram {
     uint histogram[];
 };
 
-layout (std140, binding = 2) uniform Params {
-    uint num_elements;
-    uint pass_index;  // 0-7 for 64-bit keys
-};
+uniform uint u_shift;
 
-shared uint local_histogram[RADIX_SIZE];
+shared uint sh_hist[256];
 
 void main() {
-    uint local_id = gl_LocalInvocationID.x;
-    uint global_id = gl_GlobalInvocationID.x;
-    uint workgroup_id = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uint wg = gl_WorkGroupID.x;
 
-    // Initialize local histogram
-    local_histogram[local_id] = 0;
+    sh_hist[lid] = 0u;
     barrier();
 
-    // Count elements in each bin
-    if (global_id < num_elements) {
-        uint64_t key = keys[global_id];
-        uint shift = pass_index * RADIX_BITS;
-        uint radix = uint((key >> shift) & 0xFFu);
-        atomicAdd(local_histogram[radix], 1);
+    for (uint b = 0u; b < BLOCKS_PER_WG; ++b) {
+        uint i = wg * BLOCKS_PER_WG * 256u + b * 256u + lid;
+        if (i < num_instances) {
+            uint d = (keys_in[i] >> u_shift) & 255u;
+            atomicAdd(sh_hist[d], 1u);
+        }
     }
 
     barrier();
-
-    // Write local histogram to global memory
-    // Layout: histogram[workgroup_id * 256 + radix] = count
-    histogram[workgroup_id * RADIX_SIZE + local_id] = local_histogram[local_id];
+    histogram[lid * num_wgs_sort + wg] = sh_hist[lid];
 }

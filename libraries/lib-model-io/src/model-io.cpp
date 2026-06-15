@@ -462,17 +462,16 @@ gaussian_splat_scene polymer::import_gaussian_splat_ply(const std::string & path
             if (f_rest[i]) f_rest_data[i] = reinterpret_cast<const float *>(f_rest[i]->buffer.get());
         }
 
-        // Determine SH degree based on available coefficients
-        // SH degree 0: 1 coeff, degree 1: 4 coeffs, degree 2: 9 coeffs, degree 3: 16 coeffs
-        int available_sh_coeffs = 1; // DC is always there
-        for (int i = 0; i < 45; ++i)
-        {
-            if (f_rest_data[i]) available_sh_coeffs = 1 + (i + 1) / 3 + 1;
-        }
+        // Determine SH degree from the number of contiguous f_rest properties.
+        // PLY layout is channel-planar: [R1..Rn][G1..Gn][B1..Bn] where n = rest coeffs
+        // per channel (3 for degree 1, 8 for degree 2, 15 for degree 3).
+        int num_rest = 0;
+        while (num_rest < 45 && f_rest_data[num_rest]) num_rest++;
+        const int rest_per_channel = num_rest / 3;
 
-        if (available_sh_coeffs >= 16) scene.sh_degree = 3;
-        else if (available_sh_coeffs >= 9) scene.sh_degree = 2;
-        else if (available_sh_coeffs >= 4) scene.sh_degree = 1;
+        if (rest_per_channel >= 15) scene.sh_degree = 3;
+        else if (rest_per_channel >= 8) scene.sh_degree = 2;
+        else if (rest_per_channel >= 3) scene.sh_degree = 1;
         else scene.sh_degree = 0;
 
         // Helper: sigmoid function
@@ -522,16 +521,13 @@ gaussian_splat_scene polymer::import_gaussian_splat_ply(const std::string & path
             if (f_dc_data[1]) v.shs[1] = f_dc_data[1][i];
             if (f_dc_data[2]) v.shs[2] = f_dc_data[2][i];
 
-            // Rest of SH coefficients
-            // f_rest layout: [R1..R15][G1..G15][B1..B15]
-            // f_rest_0..f_rest_14 = R coeffs 1-15
-            // f_rest_15..f_rest_29 = G coeffs 1-15
-            // f_rest_30..f_rest_44 = B coeffs 1-15
-            for (int sh_idx = 1; sh_idx < 16; ++sh_idx)
+            // Rest of SH coefficients, channel-planar with rest_per_channel coeffs per
+            // channel (NOT always 15 -- degree 1 and 2 files store 3 and 8 respectively)
+            for (int sh_idx = 1; sh_idx <= rest_per_channel; ++sh_idx)
             {
-                int r_idx = sh_idx - 1;
-                int g_idx = sh_idx - 1 + 15;
-                int b_idx = sh_idx - 1 + 30;
+                const int r_idx = sh_idx - 1;
+                const int g_idx = sh_idx - 1 + rest_per_channel;
+                const int b_idx = sh_idx - 1 + rest_per_channel * 2;
 
                 if (f_rest_data[r_idx]) v.shs[sh_idx * 3 + 0] = f_rest_data[r_idx][i];
                 if (f_rest_data[g_idx]) v.shs[sh_idx * 3 + 1] = f_rest_data[g_idx][i];

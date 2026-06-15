@@ -1,44 +1,62 @@
 #version 450 core
-#extension GL_ARB_gpu_shader_int64 : enable
+
+// Detects [start, end) runs of equal tile ids in the sorted key stream. The boundaries
+// buffer is zero-cleared each frame, so untouched (empty) tiles read start == end == 0.
+// Four strided elements per thread keeps the workgroup count under GL's 65535 floor
+// even at very large instance counts.
 
 layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-layout (std430, binding = 0) readonly buffer SortedKeys {
-    uint64_t keys[];
+layout (std140, binding = 0) uniform FrameParams {
+    mat4 view_3dgs;
+    mat4 viewproj;
+    vec4 cam_pos_model;
+    vec4 bg_color;
+    uvec2 resolution;
+    uvec2 tile_grid;
+    uint tile_bits;
+    uint num_gaussians;
+    uint sh_degree;
+    float scale_modifier;
+    float tan_fovx;
+    float tan_fovy;
+    float focal_x;
+    float focal_y;
 };
 
-layout (std430, binding = 1) writeonly buffer Boundaries {
-    uint boundaries[];  // [start, end] pairs for each tile
-};
-
-layout (std140, binding = 2) uniform Params {
+layout (std430, binding = 1) readonly buffer GpuState {
+    uint total_unclamped;
     uint num_instances;
-    uint num_tiles;
+    uint num_wgs_sort;
+    uint instance_capacity;
+};
+
+layout (std430, binding = 2) readonly buffer SortedKeys {
+    uint sorted_keys[];
+};
+
+layout (std430, binding = 3) writeonly buffer Boundaries {
+    uint boundaries[];
 };
 
 void main() {
-    uint index = gl_GlobalInvocationID.x;
-    if (index >= num_instances) {
-        return;
-    }
+    uint depth_bits = 32u - tile_bits;
+    uint base = gl_WorkGroupID.x * 1024u;
 
-    // Extract tile index from key (upper 32 bits)
-    uint tile_id = uint(keys[index] >> 32);
+    for (uint j = 0u; j < 4u; ++j) {
+        uint i = base + j * 256u + gl_LocalInvocationID.x;
+        if (i >= num_instances) continue;
 
-    if (index == 0) {
-        // First element starts its tile
-        boundaries[tile_id * 2] = index;
-    } else {
-        uint prev_tile_id = uint(keys[index - 1] >> 32);
-        if (tile_id != prev_tile_id) {
-            // Tile boundary
-            boundaries[tile_id * 2] = index;       // Start of new tile
-            boundaries[prev_tile_id * 2 + 1] = index;  // End of previous tile
+        uint tile = sorted_keys[i] >> depth_bits;
+        if (i == 0u) {
+            boundaries[tile * 2u] = 0u;
+        } else {
+            uint prev_tile = sorted_keys[i - 1u] >> depth_bits;
+            if (tile != prev_tile) {
+                boundaries[prev_tile * 2u + 1u] = i;
+                boundaries[tile * 2u] = i;
+            }
         }
-    }
-
-    if (index == num_instances - 1) {
-        // Last element ends its tile
-        boundaries[tile_id * 2 + 1] = num_instances;
+        if (i == num_instances - 1u) boundaries[tile * 2u + 1u] = num_instances;
     }
 }

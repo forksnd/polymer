@@ -1,0 +1,87 @@
+#version 450 core
+
+// Stable LSD radix sort, stage 3 of 3: scatter using the scanned digit-major histogram.
+// Within a workgroup, elements are placed by a bitflag rank (popcount of lower lanes with
+// the same digit), so placement depends only on lane order, never on atomic timing --
+// which is what keeps every pass stable, a hard requirement for LSD radix correctness.
+
+#define BLOCKS_PER_WG 32u
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (std430, binding = 0) readonly buffer GpuState {
+    uint total_unclamped;
+    uint num_instances;
+    uint num_wgs_sort;
+    uint instance_capacity;
+};
+
+layout (std430, binding = 1) readonly buffer KeysIn {
+    uint keys_in[];
+};
+
+layout (std430, binding = 2) readonly buffer PayloadsIn {
+    uint payloads_in[];
+};
+
+layout (std430, binding = 3) writeonly buffer KeysOut {
+    uint keys_out[];
+};
+
+layout (std430, binding = 4) writeonly buffer PayloadsOut {
+    uint payloads_out[];
+};
+
+layout (std430, binding = 5) readonly buffer Histogram {
+    uint histogram[];
+};
+
+uniform uint u_shift;
+
+shared uint global_offsets[256];
+shared uint flags[256][8]; // one bit per lane: 256 lanes = 8 uints per digit
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint wg = gl_WorkGroupID.x;
+
+    // Scanned histogram entry = absolute output cursor for (digit = lid, this workgroup)
+    global_offsets[lid] = histogram[lid * num_wgs_sort + wg];
+
+    for (uint b = 0u; b < BLOCKS_PER_WG; ++b) {
+        for (uint w = 0u; w < 8u; ++w) flags[lid][w] = 0u;
+        barrier(); // orders flag zeroing (and, first iteration, the global_offsets writes)
+
+        uint i = wg * BLOCKS_PER_WG * 256u + b * 256u + lid;
+        bool is_valid = i < num_instances;
+        uint key = 0u;
+        uint payload = 0u;
+        uint d = 0u;
+        uint base = 0u;
+        if (is_valid) {
+            key = keys_in[i];
+            payload = payloads_in[i];
+            d = (key >> u_shift) & 255u;
+            base = global_offsets[d];
+            atomicOr(flags[d][lid >> 5u], 1u << (lid & 31u));
+        }
+        barrier();
+
+        if (is_valid) {
+            uint rank = 0u;
+            uint count = 0u;
+            uint my_word = lid >> 5u;
+            for (uint w = 0u; w < 8u; ++w) {
+                uint f = flags[d][w];
+                uint full = bitCount(f);
+                if (w < my_word) rank += full;
+                else if (w == my_word) rank += bitCount(f & ((1u << (lid & 31u)) - 1u));
+                count += full;
+            }
+            keys_out[base + rank] = key;
+            payloads_out[base + rank] = payload;
+            if (rank == count - 1u) atomicAdd(global_offsets[d], count); // advance cursor once per bin
+        }
+        barrier(); // cursor update visible before the next block snapshots it
+    }
+}

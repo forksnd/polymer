@@ -1,0 +1,44 @@
+#version 450 core
+
+// Hierarchical exclusive scan, pass B: a single workgroup turns the per-block totals
+// from pass A into exclusive block offsets, in place, carrying across 256-wide chunks.
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (std430, binding = 0) readonly buffer ScanLength {
+    uint scan_length;
+};
+
+layout (std430, binding = 3) buffer BlockSums {
+    uint block_sums[];
+};
+
+shared uint sh[256];
+shared uint carry;
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint num_blocks = (scan_length + 2047u) / 2048u;
+
+    if (lid == 0u) carry = 0u;
+    barrier();
+
+    for (uint chunk = 0u; chunk * 256u < num_blocks; ++chunk) {
+        uint i = chunk * 256u + lid;
+        uint v = (i < num_blocks) ? block_sums[i] : 0u;
+
+        sh[lid] = v;
+        barrier();
+        for (uint s = 1u; s < 256u; s <<= 1u) {
+            uint t = (lid >= s) ? sh[lid - s] : 0u;
+            barrier();
+            sh[lid] += t;
+            barrier();
+        }
+
+        if (i < num_blocks) block_sums[i] = carry + sh[lid] - v;
+        barrier();
+        if (lid == 0u) carry += sh[255];
+        barrier();
+    }
+}

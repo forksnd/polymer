@@ -1,28 +1,43 @@
 #version 450 core
 
+// 3D covariance from rotation + scale: Sigma = R_std diag(s^2) R_std^T, computed as
+// transpose(M) * M with M = S * R where R is stored transposed (GLSL constructors are
+// column-major) -- identical algebra to the INRIA reference. Runs only when the scene
+// or scale modifier changes, never per frame.
+
 layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-struct Vertex {
-    vec4 position;
-    vec4 scale_opacity;
-    vec4 rotation;
-    float sh[48];
+layout (std140, binding = 0) uniform FrameParams {
+    mat4 view_3dgs;
+    mat4 viewproj;
+    vec4 cam_pos_model;
+    vec4 bg_color;
+    uvec2 resolution;
+    uvec2 tile_grid;
+    uint tile_bits;
+    uint num_gaussians;
+    uint sh_degree;
+    float scale_modifier;
+    float tan_fovx;
+    float tan_fovy;
+    float focal_x;
+    float focal_y;
 };
 
-layout (std430, binding = 0) readonly buffer Vertices {
-    Vertex vertices[];
+struct rot_scale {
+    vec4 rotation; // normalized quaternion stored (w, x, y, z)
+    vec4 scale;    // post-exp scale in xyz
 };
 
-layout (std430, binding = 1) writeonly buffer Cov3Ds {
+layout (std430, binding = 1) readonly buffer RotScales {
+    rot_scale rot_scales[];
+};
+
+layout (std430, binding = 2) writeonly buffer Cov3Ds {
     float cov3ds[];
 };
 
-layout (std140, binding = 2) uniform Params {
-    float scale_modifier;
-    uint num_gaussians;
-};
-
-mat3 rotationFromQuaternion(vec4 q) {
+mat3 rotation_from_quaternion(vec4 q) {
     float qw = q.x;
     float qx = q.y;
     float qy = q.z;
@@ -32,6 +47,7 @@ mat3 rotationFromQuaternion(vec4 q) {
     float qy2 = qy * qy;
     float qz2 = qz * qz;
 
+    // Textbook rows written into columns: R = R_std^T, consumed as transpose(M) * M below
     mat3 R;
     R[0][0] = 1.0 - 2.0 * qy2 - 2.0 * qz2;
     R[0][1] = 2.0 * qx * qy - 2.0 * qz * qw;
@@ -49,29 +65,22 @@ mat3 rotationFromQuaternion(vec4 q) {
 }
 
 void main() {
-    uint index = gl_GlobalInvocationID.x;
-    if (index >= num_gaussians) {
-        return;
-    }
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= num_gaussians) return;
 
-    // Build scale matrix
     mat3 S = mat3(1.0);
-    S[0][0] = vertices[index].scale_opacity.x * scale_modifier;
-    S[1][1] = vertices[index].scale_opacity.y * scale_modifier;
-    S[2][2] = vertices[index].scale_opacity.z * scale_modifier;
+    S[0][0] = rot_scales[i].scale.x * scale_modifier;
+    S[1][1] = rot_scales[i].scale.y * scale_modifier;
+    S[2][2] = rot_scales[i].scale.z * scale_modifier;
 
-    // Compute rotation matrix from quaternion
-    mat3 R = rotationFromQuaternion(vertices[index].rotation);
-
-    // Covariance = R * S * S^T * R^T = (S * R)^T * (S * R)
+    mat3 R = rotation_from_quaternion(rot_scales[i].rotation);
     mat3 M = S * R;
     mat3 cov3d = transpose(M) * M;
 
-    // Store upper triangular (6 floats)
-    cov3ds[index * 6 + 0] = cov3d[0][0];
-    cov3ds[index * 6 + 1] = cov3d[0][1];
-    cov3ds[index * 6 + 2] = cov3d[0][2];
-    cov3ds[index * 6 + 3] = cov3d[1][1];
-    cov3ds[index * 6 + 4] = cov3d[1][2];
-    cov3ds[index * 6 + 5] = cov3d[2][2];
+    cov3ds[i * 6u + 0u] = cov3d[0][0];
+    cov3ds[i * 6u + 1u] = cov3d[0][1];
+    cov3ds[i * 6u + 2u] = cov3d[0][2];
+    cov3ds[i * 6u + 3u] = cov3d[1][1];
+    cov3ds[i * 6u + 4u] = cov3d[1][2];
+    cov3ds[i * 6u + 5u] = cov3d[2][2];
 }
